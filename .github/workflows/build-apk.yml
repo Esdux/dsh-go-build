@@ -18,6 +18,8 @@ env:
   FLUTTER_VERSION: 3.47.7
   TZ: Asia/Shanghai
   DSH_BETA_TOKEN_FILE: ""
+  # The Aliyun mirrors answer 502 from a US runner; resolve straight from Maven Central.
+  DSH_MAVEN_MIRRORS: "0"
   SOURCE_REPO: https://github.com/Esdux/dsh-Go.git
   SOURCE_BRANCH: ci-apk
 
