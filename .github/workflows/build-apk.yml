@@ -1,0 +1,125 @@
+# Builds an arm64 APK from the patched fork (Esdux/dsh-Go, branch ci-apk).
+# This repository is not a fork, so its Actions are not disabled by GitHub.
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apk-build
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: 3.47.7
+  TZ: Asia/Shanghai
+  DSH_BETA_TOKEN_FILE: ""
+  SOURCE_REPO: https://github.com/Esdux/dsh-Go.git
+  SOURCE_BRANCH: ci-apk
+
+jobs:
+  apk:
+    name: arm64 release APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Clone the fork
+        run: |
+          git clone --depth 1 --branch "$SOURCE_BRANCH" "$SOURCE_REPO" src
+          cd src && git log --oneline -1
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gpgv zstd file unzip xz-utils
+
+      - name: Android SDK setup
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+          log-accepted-android-sdk-licenses: false
+
+      - name: Android SDK packages
+        working-directory: src
+        run: |
+          set -euo pipefail
+          sdkm=$(command -v sdkmanager || true)
+          if [ -z "$sdkm" ]; then
+            sdkm=$(find /usr/local/lib/android "$HOME" -maxdepth 6 -type f -name sdkmanager 2>/dev/null | head -1)
+          fi
+          test -n "$sdkm"
+          ext=$(find "$FLUTTER_ROOT/packages/flutter_tools/gradle/src/main" -name 'FlutterExtension.*' -print -quit)
+          ndk=$(grep -oE 'ndkVersion[^"]*"[0-9.]+"' "$ext" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          sdk=$(grep -oE 'compileSdkVersion[^0-9]*[0-9]+' "$ext" | grep -oE '[0-9]+$' | head -1)
+          yes | "$sdkm" --licenses >/dev/null 2>&1 || true
+          "$sdkm" "platform-tools" "platforms;android-$sdk" "build-tools;$sdk.0.0" "ndk;$ndk" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
+
+      - name: Cache runtime downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/runtime/.cache
+            src/runtime/out
+          key: runtime-arm64-${{ hashFiles('src/runtime/build-runtime.sh') }}
+          restore-keys: |
+            runtime-arm64-
+
+      - name: Generate l10n
+        working-directory: src
+        run: python3 app/tool/l10n_merge.py
+
+      - name: Flutter packages
+        working-directory: src/app
+        run: |
+          flutter pub get --enforce-lockfile
+          printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$FLUTTER_ROOT" > android/local.properties
+
+      - name: Runtime bundle (arm64-v8a)
+        working-directory: src
+        run: bash runtime/build-runtime.sh arm64-v8a
+
+      - name: Build APK
+        working-directory: src
+        run: |
+          set -euo pipefail
+          base=$(sed -nE 's/^version:[[:space:]]*([0-9][0-9.]*).*/\1/p' app/pubspec.yaml | head -1)
+          name="${base:-0.0.0}-ci.${GITHUB_SHA::8}"
+          bash tooling/build-apk.sh -f arm64 --no-companion --build-name "$name"
+
+      - name: Collect APK
+        run: |
+          set -euo pipefail
+          apk=src/app/build/app/outputs/flutter-apk/app-arm64-release.apk
+          test -f "$apk"
+          mkdir -p out
+          cp "$apk" "out/dsh-go-${GITHUB_SHA::8}-arm64.apk"
+          ( cd out && sha256sum ./*.apk > SHA256SUMS )
+          cat out/SHA256SUMS
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-go-arm64-${{ github.sha }}
+          path: |
+            out/*.apk
+            out/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
